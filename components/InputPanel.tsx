@@ -2,6 +2,10 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
+import { calculateTotalCapitalNeeded } from '@/lib/calculations';
+import { formatCurrency } from '@/lib/utils';
+import CurrencyInput from '@/components/ui/CurrencyInput';
+import PercentInput from '@/components/ui/PercentInput';
 
 // ─── Section definitions ──────────────────────────────────────────────────────
 
@@ -13,21 +17,18 @@ type SectionKey =
   | 'mortgageContext';
 
 const SECTIONS: { key: SectionKey; title: string }[] = [
-  { key: 'purchaseTarget', title: 'Purchase Target' },
-  { key: 'currentAssets',  title: 'Current Assets'  },
-  { key: 'cashFlow',       title: 'Monthly Cash Flow' },
-  { key: 'assumptions',    title: 'Investment Assumptions' },
-  { key: 'mortgageContext', title: 'Mortgage Context' },
+  { key: 'purchaseTarget',  title: 'Purchase Target'        },
+  { key: 'currentAssets',   title: 'Current Assets'         },
+  { key: 'cashFlow',        title: 'Monthly Cash Flow'      },
+  { key: 'assumptions',     title: 'Investment Assumptions' },
+  { key: 'mortgageContext', title: 'Mortgage Context'       },
 ];
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// ─── Root component ───────────────────────────────────────────────────────────
 
 export default function InputPanel() {
-  // Store is imported here to enforce single-source-of-truth.
-  // Individual sections will destructure the values they need as they are built.
   const { scenarioName } = useStore();
 
-  // All sections open by default
   const [open, setOpen] = useState<Record<SectionKey, boolean>>({
     purchaseTarget:  true,
     currentAssets:   true,
@@ -38,6 +39,15 @@ export default function InputPanel() {
 
   const toggle = (key: SectionKey) =>
     setOpen((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  // Map each key to its content — replace placeholder as each section is built
+  const content: Record<SectionKey, React.ReactNode> = {
+    purchaseTarget:  <PurchaseTargetSection />,
+    currentAssets:   <Placeholder />,
+    cashFlow:        <Placeholder />,
+    assumptions:     <Placeholder />,
+    mortgageContext: <Placeholder />,
+  };
 
   return (
     <aside
@@ -56,7 +66,7 @@ export default function InputPanel() {
       </div>
 
       {/* Collapsible sections */}
-      <div className="flex flex-col gap-0 py-2">
+      <div className="flex flex-col py-2">
         {SECTIONS.map(({ key, title }) => (
           <Section
             key={key}
@@ -64,8 +74,7 @@ export default function InputPanel() {
             isOpen={open[key]}
             onToggle={() => toggle(key)}
           >
-            {/* Placeholder — each section body will be replaced in future prompts */}
-            <p className="text-xs text-gray-400 italic">Coming soon</p>
+            {content[key]}
           </Section>
         ))}
       </div>
@@ -73,7 +82,146 @@ export default function InputPanel() {
   );
 }
 
-// ─── Collapsible section ──────────────────────────────────────────────────────
+// ─── Purchase Target section ──────────────────────────────────────────────────
+
+const MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+function PurchaseTargetSection() {
+  const { purchaseTarget, assumptions, setPurchaseTarget } = useStore();
+
+  // Derive the currently-selected month and year from targetMonthsFromNow
+  const derivedDate = new Date();
+  derivedDate.setDate(1);
+  derivedDate.setMonth(derivedDate.getMonth() + purchaseTarget.targetMonthsFromNow);
+  const selectedMonth = derivedDate.getMonth() + 1; // 1-indexed
+  const selectedYear  = derivedDate.getFullYear();
+
+  const currentYear = new Date().getFullYear();
+  const years = Array.from({ length: 8 }, (_, i) => currentYear + i);
+
+  /** Converts a month (1-12) + year to monthsFromNow, clamped to 6–60. */
+  const toMonthsFromNow = (month: number, year: number): number => {
+    const now = new Date();
+    now.setDate(1);
+    const target = new Date(year, month - 1, 1);
+    const raw = (target.getFullYear() - now.getFullYear()) * 12
+              + (target.getMonth() - now.getMonth());
+    return Math.max(6, Math.min(60, raw));
+  };
+
+  const handleMonthChange = (month: number) => {
+    setPurchaseTarget({ targetMonthsFromNow: toMonthsFromNow(month, selectedYear) });
+  };
+
+  const handleYearChange = (year: number) => {
+    setPurchaseTarget({ targetMonthsFromNow: toMonthsFromNow(selectedMonth, year) });
+  };
+
+  const totalCapitalNeeded = calculateTotalCapitalNeeded(purchaseTarget, assumptions);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <CurrencyInput
+        label="Target Home Price"
+        value={purchaseTarget.targetHomePrice}
+        onChange={(v) => setPurchaseTarget({ targetHomePrice: v })}
+        min={100_000}
+        max={3_000_000}
+        tooltip="The price you expect to pay for the home. This grows over time based on your Home Price Appreciation assumption."
+      />
+
+      <PercentInput
+        label="Down Payment"
+        value={purchaseTarget.downPaymentPct}
+        onChange={(v) => setPurchaseTarget({ downPaymentPct: v })}
+        min={0.03}
+        max={0.40}
+        tooltip="Percentage of home price paid upfront. 20% avoids PMI."
+      />
+
+      <PercentInput
+        label="Closing Costs"
+        value={purchaseTarget.closingCostPct}
+        onChange={(v) => setPurchaseTarget({ closingCostPct: v })}
+        min={0.01}
+        max={0.06}
+        tooltip="Typically 2–4% of purchase price. Covers lender fees, title insurance, escrow, and other transaction costs."
+      />
+
+      <PercentInput
+        label="Post-Close Reserve"
+        value={purchaseTarget.postCloseReservePct}
+        onChange={(v) => setPurchaseTarget({ postCloseReservePct: v })}
+        min={0}
+        max={0.05}
+        tooltip="Cash you want to keep liquid after closing for immediate repairs, moving costs, and emergencies."
+      />
+
+      {/* Target Purchase Date */}
+      <div className="flex flex-col gap-1.5">
+        <label className="text-xs font-semibold uppercase tracking-wide text-[#1B3A5C]">
+          Target Purchase Date
+        </label>
+        <div className="flex gap-2">
+          <select
+            value={selectedMonth}
+            onChange={(e) => handleMonthChange(Number(e.target.value))}
+            aria-label="Purchase month"
+            className="
+              flex-1 rounded-md border border-gray-300 bg-white
+              px-2 py-2 text-sm text-gray-900
+              hover:border-[#2E6DA4]
+              focus:border-[#2E6DA4] focus:outline-none focus:ring-2 focus:ring-[#D6E8F7]
+              transition-colors duration-150
+            "
+          >
+            {MONTHS.map((m, i) => (
+              <option key={m} value={i + 1}>{m}</option>
+            ))}
+          </select>
+
+          <select
+            value={selectedYear}
+            onChange={(e) => handleYearChange(Number(e.target.value))}
+            aria-label="Purchase year"
+            className="
+              flex-1 rounded-md border border-gray-300 bg-white
+              px-2 py-2 text-sm text-gray-900
+              hover:border-[#2E6DA4]
+              focus:border-[#2E6DA4] focus:outline-none focus:ring-2 focus:ring-[#D6E8F7]
+              transition-colors duration-150
+            "
+          >
+            {years.map((y) => (
+              <option key={y} value={y}>{y}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Total Capital Needed summary */}
+      <div className="rounded-lg bg-[#1B3A5C] px-4 py-3">
+        <p className="text-[10px] font-semibold uppercase tracking-widest text-[#D6E8F7]/80">
+          Total Capital Needed
+        </p>
+        <p className="mt-1 text-xl font-bold text-white">
+          {formatCurrency(totalCapitalNeeded)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Placeholder (other sections, not yet built) ──────────────────────────────
+
+function Placeholder() {
+  return <p className="text-xs italic text-gray-400">Coming soon</p>;
+}
+
+// ─── Collapsible section shell ────────────────────────────────────────────────
 
 interface SectionProps {
   title: string;
@@ -84,8 +232,7 @@ interface SectionProps {
 
 function Section({ title, isOpen, onToggle, children }: SectionProps) {
   return (
-    <div className="border-l-[3px] border-[#2E6DA4] mx-3 my-1 rounded-sm overflow-hidden">
-      {/* Header button */}
+    <div className="mx-3 my-1 overflow-hidden rounded-sm border-l-[3px] border-[#2E6DA4]">
       <button
         type="button"
         onClick={onToggle}
@@ -97,7 +244,6 @@ function Section({ title, isOpen, onToggle, children }: SectionProps) {
           focus:outline-none focus-visible:ring-2 focus-visible:ring-[#2E6DA4]
         "
       >
-        {/* Chevron — rotates to point up when section is open */}
         <ChevronIcon
           className={`
             h-3.5 w-3.5 shrink-0 text-[#2E6DA4]
@@ -105,13 +251,11 @@ function Section({ title, isOpen, onToggle, children }: SectionProps) {
             ${isOpen ? 'rotate-180' : 'rotate-0'}
           `}
         />
-
         <span className="flex-1 text-left text-xs font-bold uppercase tracking-wider text-[#1B3A5C]">
           {title}
         </span>
       </button>
 
-      {/* Body — CSS max-height collapse/expand */}
       <div
         className={`
           overflow-hidden transition-[max-height,opacity] duration-300 ease-in-out
@@ -140,7 +284,6 @@ function ChevronIcon({ className }: { className?: string }) {
       viewBox="0 0 24 24"
       className={className}
     >
-      {/* Down chevron: rotates to up when section is open */}
       <path d="M6 9l6 6 6-6" />
     </svg>
   );
