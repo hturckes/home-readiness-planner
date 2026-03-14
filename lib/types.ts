@@ -5,6 +5,8 @@ export interface PurchaseTarget {
   downPaymentPct: number;
   closingCostPct: number;
   postCloseReservePct: number;
+  /** One-time cost for furniture, moving, and immediate repairs. */
+  moveInCosts: number;
   targetMonthsFromNow: number;
 }
 
@@ -28,6 +30,10 @@ export interface MonthlyCashFlow {
   otherSavingsRate: number;
   annualIncomeGrowthRate: number;
   annualSavingsRateIncrease: number;
+  /** Current rent payment that will disappear after purchase. */
+  currentMonthlyRent: number;
+  /** All non-housing recurring expenses: groceries, utilities, subscriptions, etc. */
+  otherMonthlyExpenses: number;
 }
 
 // ─── Investment Assumptions ───────────────────────────────────────────────────
@@ -58,6 +64,16 @@ export interface MortgageInputs {
   annualPropertyTaxRate: number;
   annualInsurance: number;
   pmiRate: number;
+}
+
+// ─── Mortgage Payment Result ──────────────────────────────────────────────────
+
+export interface MortgagePaymentResult {
+  principalAndInterest: number;
+  pmi: number;
+  tax: number;
+  insurance: number;
+  total: number;
 }
 
 // ─── App State ────────────────────────────────────────────────────────────────
@@ -170,6 +186,7 @@ export const DEFAULT_STATE: AppState = {
     downPaymentPct: 0.20,
     closingCostPct: 0.03,
     postCloseReservePct: 0.02,
+    moveInCosts: 10000,
     targetMonthsFromNow: 36,
   },
 
@@ -181,6 +198,8 @@ export const DEFAULT_STATE: AppState = {
     otherSavingsRate: 0,
     annualIncomeGrowthRate: 0.03,
     annualSavingsRateIncrease: 0,
+    currentMonthlyRent: 2000,
+    otherMonthlyExpenses: 3000,
   },
 
   assumptions: {

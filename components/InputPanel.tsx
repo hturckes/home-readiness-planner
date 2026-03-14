@@ -2,7 +2,12 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
-import { calculateTotalCapitalNeeded } from '@/lib/calculations';
+import {
+  calculatePurchaseDayCapital,
+  calculateFullReadinessCapital,
+  calculateMortgagePayment,
+  calculateAccessibleCapital,
+} from '@/lib/calculations';
 import { formatCurrency } from '@/lib/utils';
 import CurrencyInput from '@/components/ui/CurrencyInput';
 import PercentInput from '@/components/ui/PercentInput';
@@ -43,8 +48,8 @@ export default function InputPanel() {
   // Map each key to its content — replace placeholder as each section is built
   const content: Record<SectionKey, React.ReactNode> = {
     purchaseTarget:  <PurchaseTargetSection />,
-    currentAssets:   <Placeholder />,
-    cashFlow:        <Placeholder />,
+    currentAssets:   <CurrentAssetsSection />,
+    cashFlow:        <CashFlowSection />,
     assumptions:     <Placeholder />,
     mortgageContext: <Placeholder />,
   };
@@ -90,7 +95,8 @@ const MONTHS = [
 ];
 
 function PurchaseTargetSection() {
-  const { purchaseTarget, assumptions, setPurchaseTarget } = useStore();
+  const state = useStore();
+  const { purchaseTarget, cashFlow, assumptions, setPurchaseTarget } = state;
 
   // Derive the currently-selected month and year from targetMonthsFromNow
   const derivedDate = new Date();
@@ -120,7 +126,14 @@ function PurchaseTargetSection() {
     setPurchaseTarget({ targetMonthsFromNow: toMonthsFromNow(selectedMonth, year) });
   };
 
-  const totalCapitalNeeded = calculateTotalCapitalNeeded(purchaseTarget, assumptions);
+  // Summary values — recomputed on every input change (no debounce needed)
+  const purchaseDayCapital    = calculatePurchaseDayCapital(purchaseTarget, assumptions);
+  const fullReadinessCapital  = calculateFullReadinessCapital(
+    purchaseTarget,
+    cashFlow,
+    calculateMortgagePayment(state),
+    assumptions
+  );
 
   return (
     <div className="flex flex-col gap-4">
@@ -157,7 +170,16 @@ function PurchaseTargetSection() {
         onChange={(v) => setPurchaseTarget({ postCloseReservePct: v })}
         min={0}
         max={0.05}
-        tooltip="Cash you want to keep liquid after closing for immediate repairs, moving costs, and emergencies."
+        tooltip="Cash you want to keep liquid after closing. Held in savings for immediate repairs, surprises, or emergencies. This stays in your account — it is not spent at closing."
+      />
+
+      <CurrencyInput
+        label="Move-In Costs"
+        value={purchaseTarget.moveInCosts}
+        onChange={(v) => setPurchaseTarget({ moveInCosts: v })}
+        min={0}
+        max={100_000}
+        tooltip="One-time costs at move-in: furniture, moving company, appliances, immediate repairs. Spent on or around closing day. If unsure, $10,000 is a reasonable starting estimate."
       />
 
       {/* Target Purchase Date */}
@@ -202,15 +224,318 @@ function PurchaseTargetSection() {
         </div>
       </div>
 
-      {/* Total Capital Needed summary */}
-      <div className="rounded-lg bg-[#1B3A5C] px-4 py-3">
-        <p className="text-[10px] font-semibold uppercase tracking-widest text-[#D6E8F7]/80">
-          Total Capital Needed
+      {/* ── Summary boxes ───────────────────────────────────────────── */}
+      <div className="flex flex-col gap-2">
+
+        {/* Box 1 — Purchase Day Capital (lighter style) */}
+        <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
+          <div className="flex items-center gap-1">
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">
+              Purchase Day Capital
+            </p>
+            <SummaryTooltip
+              text="Down payment + closing costs + move-in costs. The cash that leaves your account on closing day."
+            />
+          </div>
+          <p className="mt-1 text-xl font-bold text-[#1B3A5C]">
+            {formatCurrency(purchaseDayCapital)}
+          </p>
+          <p className="mt-0.5 text-[9px] text-gray-400">Due at or before closing</p>
+        </div>
+
+        {/* Box 2 — Full Readiness Capital (primary navy style) */}
+        <div className="rounded-lg bg-[#1B3A5C] px-4 py-3">
+          <div className="flex items-center gap-1">
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-[#D6E8F7]/80">
+              Full Readiness Capital
+            </p>
+            <SummaryTooltip
+              text="Everything due at closing, plus your post-close reserve, plus 4 months of post-purchase living expenses as a transition buffer. This is what the app plans toward."
+              dark
+            />
+          </div>
+          <p className="mt-1 text-xl font-bold text-white">
+            {formatCurrency(fullReadinessCapital)}
+          </p>
+          <p className="mt-0.5 text-[9px] text-[#D6E8F7]/50">
+            Your savings target — includes 4-month buffer
+          </p>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+// ─── Summary box tooltip ──────────────────────────────────────────────────────
+// Reusable ℹ tooltip for the summary boxes at the bottom of each section.
+// Uses the same CSS group/group-hover pattern as CurrencyInput's TooltipIcon.
+
+function SummaryTooltip({ text, dark = false }: { text: string; dark?: boolean }) {
+  const badgeClasses = dark
+    ? 'border-[#D6E8F7]/60 text-[#D6E8F7]/60'
+    : 'border-gray-400 text-gray-400';
+
+  return (
+    <span className="group relative inline-flex cursor-help">
+      <span
+        aria-hidden="true"
+        className={`
+          flex h-3.5 w-3.5 items-center justify-center rounded-full border
+          text-[9px] font-bold leading-none select-none
+          ${badgeClasses}
+        `}
+      >
+        i
+      </span>
+      <span
+        role="tooltip"
+        className="
+          pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 w-52
+          -translate-x-1/2 rounded-md bg-gray-900 px-2.5 py-2 text-xs
+          leading-snug text-white shadow-lg
+          opacity-0 transition-opacity duration-150 group-hover:opacity-100
+        "
+      >
+        {text}
+        <span className="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
+      </span>
+    </span>
+  );
+}
+
+// ─── Current Assets section ───────────────────────────────────────────────────
+
+/** Balance input tooltip text keyed by bucket id. */
+const BUCKET_TOOLTIPS: Record<string, string> = {
+  'cash-hysa':
+    'Cash in checking, savings, or high-yield savings accounts. Fully accessible with no penalties or taxes.',
+  'taxable-brokerage':
+    'Stocks, ETFs, or mutual funds in a standard brokerage account. Capital gains tax applies on appreciation when sold.',
+  'roth-ira':
+    'Enter your contributions portion only — not the full account value. Roth IRA contributions can be withdrawn penalty-free at any time.',
+  'traditional-ira-401k':
+    'Pre-tax retirement savings. Early withdrawal before age 59½ incurs a 10% penalty plus ordinary income tax.',
+  'other':
+    'Other assets such as real estate equity or business value. Typically illiquid — cannot be quickly converted to cash for a purchase.',
+};
+
+function CurrentAssetsSection() {
+  const { assetBuckets, assumptions } = useStore();
+
+  const accessibleCapital = calculateAccessibleCapital(
+    assetBuckets,
+    assumptions.capitalGainsTaxRate
+  );
+
+  return (
+    <div className="flex flex-col gap-0">
+      {/* Bucket rows — separated by hairline dividers */}
+      {assetBuckets.map((bucket, idx) => (
+        <div
+          key={bucket.id}
+          className={idx > 0 ? 'border-t border-gray-100 pt-4 mt-4' : ''}
+        >
+          <AssetBucketRow bucket={bucket} />
+        </div>
+      ))}
+
+      {/* Accessible Capital summary */}
+      <div className="mt-5 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
+        <p className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">
+          Accessible Capital (est. after tax)
         </p>
-        <p className="mt-1 text-xl font-bold text-white">
-          {formatCurrency(totalCapitalNeeded)}
+        <p className="mt-1 text-xl font-bold text-[#1B3A5C]">
+          {formatCurrency(accessibleCapital)}
         </p>
       </div>
+    </div>
+  );
+}
+
+// ─── Asset Bucket Row ─────────────────────────────────────────────────────────
+
+interface AssetBucketRowProps {
+  bucket: {
+    id: string;
+    label: string;
+    balance: number;
+    costBasis: number;
+    isAvailableForPurchase: boolean;
+    isIlliquid: boolean;
+  };
+}
+
+function AssetBucketRow({ bucket }: AssetBucketRowProps) {
+  const { updateAssetBucket } = useStore();
+
+  const isIraOrK = bucket.id === 'traditional-ira-401k';
+  const isBrokerage = bucket.id === 'taxable-brokerage';
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Heading row: label + optional warning icon */}
+      <div className="flex items-center gap-1.5">
+        <span className="text-xs font-bold text-[#1B3A5C]">{bucket.label}</span>
+        {isIraOrK && (
+          <WarningTooltip text="Early withdrawal penalties apply." />
+        )}
+      </div>
+
+      {/* Balance input */}
+      <CurrencyInput
+        label="Balance"
+        value={bucket.balance}
+        onChange={(v) => updateAssetBucket(bucket.id, { balance: v })}
+        min={0}
+        max={10_000_000}
+        tooltip={BUCKET_TOOLTIPS[bucket.id] ?? 'Current account balance.'}
+      />
+
+      {/* Cost basis — taxable brokerage only */}
+      {isBrokerage && (
+        <div className="pl-0">
+          <CurrencyInput
+            label="Cost Basis"
+            value={bucket.costBasis}
+            onChange={(v) => updateAssetBucket(bucket.id, { costBasis: v })}
+            min={0}
+            max={10_000_000}
+            tooltip="Your original purchase price. Used to estimate taxes owed when liquidating. If unsure, use 70% of current balance as an estimate."
+          />
+        </div>
+      )}
+
+      {/* Use-for-purchase toggle */}
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-gray-600">Use for home purchase?</span>
+        <ToggleSwitch
+          checked={bucket.isAvailableForPurchase}
+          onChange={(checked) =>
+            updateAssetBucket(bucket.id, { isAvailableForPurchase: checked })
+          }
+          label={`Toggle ${bucket.label} for home purchase`}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─── Toggle switch ────────────────────────────────────────────────────────────
+// Pure Tailwind implementation — no external library.
+// Follows WCAG: role="switch", aria-checked, visible focus ring.
+
+interface ToggleSwitchProps {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string; // screen-reader label (aria-label)
+}
+
+function ToggleSwitch({ checked, onChange, label }: ToggleSwitchProps) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      onClick={() => onChange(!checked)}
+      className={`
+        relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center
+        rounded-full border-2 border-transparent
+        transition-colors duration-200 ease-in-out
+        focus:outline-none focus-visible:ring-2 focus-visible:ring-[#2E6DA4] focus-visible:ring-offset-1
+        ${checked ? 'bg-[#2E6DA4]' : 'bg-gray-300'}
+      `}
+    >
+      <span
+        aria-hidden="true"
+        className={`
+          pointer-events-none inline-block h-4 w-4 transform rounded-full
+          bg-white shadow-sm
+          transition-transform duration-200 ease-in-out
+          ${checked ? 'translate-x-4' : 'translate-x-0'}
+        `}
+      />
+    </button>
+  );
+}
+
+// ─── Warning tooltip ──────────────────────────────────────────────────────────
+// Amber exclamation badge with hover tooltip — used on the IRA/401k bucket.
+// Color is paired with the "!" text label so it is never the sole indicator.
+
+function WarningTooltip({ text }: { text: string }) {
+  return (
+    <span className="group relative inline-flex cursor-help">
+      {/* Badge: amber border + "!" — both color and symbol convey the warning */}
+      <span
+        aria-hidden="true"
+        className="
+          flex h-3.5 w-3.5 items-center justify-center rounded-full border
+          border-amber-500 text-[9px] font-bold leading-none text-amber-600
+          select-none
+        "
+      >
+        !
+      </span>
+      <span
+        role="tooltip"
+        className="
+          pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 w-48
+          -translate-x-1/2 rounded-md bg-gray-900 px-2.5 py-2 text-xs
+          leading-snug text-white shadow-lg
+          opacity-0 transition-opacity duration-150 group-hover:opacity-100
+        "
+      >
+        {text}
+        <span className="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
+      </span>
+    </span>
+  );
+}
+
+// ─── Monthly Cash Flow section ────────────────────────────────────────────────
+
+function CashFlowSection() {
+  const { cashFlow, setCashFlow } = useStore();
+
+  return (
+    <div className="flex flex-col gap-4">
+      <CurrencyInput
+        label="Gross Annual Income"
+        value={cashFlow.grossIncome}
+        onChange={(v) => setCashFlow({ grossIncome: v })}
+        min={0}
+        max={1_000_000}
+        tooltip="Your total pre-tax annual income. Used to calculate your debt-to-income ratio and post-purchase viability."
+      />
+
+      <CurrencyInput
+        label="Monthly Home Savings"
+        value={cashFlow.monthlyHomeSavings}
+        onChange={(v) => setCashFlow({ monthlyHomeSavings: v })}
+        min={0}
+        max={50_000}
+        tooltip="Amount you set aside each month specifically for your home purchase. This is what drives the projection."
+      />
+
+      <CurrencyInput
+        label="Current Monthly Rent"
+        value={cashFlow.currentMonthlyRent}
+        onChange={(v) => setCashFlow({ currentMonthlyRent: v })}
+        min={0}
+        max={10_000}
+        tooltip="Your current rent payment. This expense disappears after buying, which improves your post-purchase cash flow."
+      />
+
+      <CurrencyInput
+        label="Other Monthly Expenses"
+        value={cashFlow.otherMonthlyExpenses}
+        onChange={(v) => setCashFlow({ otherMonthlyExpenses: v })}
+        min={0}
+        max={20_000}
+        tooltip="All non-housing recurring expenses: groceries, utilities, car, subscriptions, dining. Used to calculate whether you can sustain the mortgage comfortably."
+      />
     </div>
   );
 }

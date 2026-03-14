@@ -1,4 +1,5 @@
 import InputPanel from '@/components/InputPanel';
+import Dashboard from '@/components/Dashboard';
 
 export default function Home() {
   return (
@@ -7,8 +8,8 @@ export default function Home() {
       <InputPanel />
 
       {/* Right content area — fills remaining space, scrollable */}
-      <main className="flex flex-1 items-center justify-center overflow-y-auto">
-        <p className="text-sm font-medium text-gray-400">Dashboard coming soon</p>
+      <main className="flex flex-1 overflow-hidden">
+        <Dashboard />
       </main>
     </div>
   );

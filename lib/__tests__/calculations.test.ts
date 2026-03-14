@@ -8,6 +8,7 @@
  *   Down payment:            20%
  *   Closing costs:           3%
  *   Post-close reserve:      2%
+ *   Move-in costs:           $10,000
  *   Target date:             24 months from now
  *   Current accessible cap:  $80,000  (all in Cash/HYSA)
  *   Monthly home savings:    $3,000/mo
@@ -22,7 +23,8 @@
  *
  *   $155,700 ≈ $600,000 × (1.035)^1 × 0.25  — only 1 year of appreciation,
  *              not 2 years (24 months). The correct value using monthly
- *              compounding over 24 months is ~$160,860.
+ *              compounding over 24 months for calculatePurchaseDayCapital is
+ *              ~$157,991 (+ $10k move-in = purchase day only, no reserve).
  *
  *   $152,000 = $80,000 + 24 × $3,000         — zero investment return.
  *              The correct value applying the dynamic glide path blended
@@ -35,7 +37,9 @@
 
 import {
   calculateAccessibleCapital,
-  calculateTotalCapitalNeeded,
+  calculatePurchaseDayCapital,
+  calculateFullReadinessCapital,
+  calculateMonthlyViability,
   generateProjection,
   getExpectedAnnualReturn,
   getGlidePathEquityPct,
@@ -46,6 +50,8 @@ import type {
   AssetBucket,
   GlidePathSettings,
   InvestmentAssumptions,
+  MonthlyCashFlow,
+  MortgagePaymentResult,
   PurchaseTarget,
 } from '@/lib/types';
 
@@ -56,6 +62,7 @@ const purchaseTarget: PurchaseTarget = {
   downPaymentPct:       0.20,
   closingCostPct:       0.03,
   postCloseReservePct:  0.02,
+  moveInCosts:          10_000,
   targetMonthsFromNow:  24,
 };
 
@@ -67,6 +74,16 @@ const assumptions: InvestmentAssumptions = {
   capitalGainsTaxRate:   0.15,
   inflationRate:         0.030,
   homePriceAppreciation: 0.035,
+};
+
+const cashFlow: MonthlyCashFlow = {
+  grossIncome:               120_000,
+  monthlyHomeSavings:        3_000,
+  otherSavingsRate:          0,
+  annualIncomeGrowthRate:    0.03,
+  annualSavingsRateIncrease: 0,
+  currentMonthlyRent:        2_000,
+  otherMonthlyExpenses:      3_000,
 };
 
 // Single HYSA bucket holding all $80k — no tax adjustments needed
@@ -89,13 +106,7 @@ const exampleState: AppState = {
   scenarioName:      'Example Test Case',
   purchaseTarget,
   assetBuckets:      [hysa80kBucket],
-  cashFlow: {
-    grossIncome:               120_000,
-    monthlyHomeSavings:        3_000,
-    otherSavingsRate:          0,
-    annualIncomeGrowthRate:    0.03,
-    annualSavingsRateIncrease: 0,
-  },
+  cashFlow,
   assumptions,
   glidePathSettings: autoGlide,
   mortgageInputs: {
@@ -107,53 +118,223 @@ const exampleState: AppState = {
   },
 };
 
-// ─── 1. calculateTotalCapitalNeeded ──────────────────────────────────────────
+// ─── 1. calculatePurchaseDayCapital ──────────────────────────────────────────
 
-describe('calculateTotalCapitalNeeded', () => {
+describe('calculatePurchaseDayCapital', () => {
   /**
-   * Formula: adjustedPrice = homePrice × (1 + appreciation/12)^months
-   *          total = adjustedPrice × (down + closing + reserve)
+   * Formula: appreciatedPrice × (down + closing) + moveInCosts
    *
-   * At 24 months with 3.5% annual appreciation (monthly compounding):
-   *   adjustedPrice = 600,000 × (1 + 0.035/12)^24 ≈ 643,439
-   *   total         = 643,439 × 0.25               ≈ 160,860
-   *
-   * CLAUDE.md example states ~$155,700. That figure corresponds to
-   * approximately one year of appreciation rather than two; the tests
-   * here validate the correct 24-month formula output.
+   * At month 0 (no appreciation):
+   *   appreciatedPrice = 600,000 × (1 + 0/12)^0 = 600,000
+   *   purchaseDayCapital = 600,000 × 0.23 + 10,000
+   *                      = 138,000 + 10,000
+   *                      = 148,000
    */
-  it('returns ~$160,860 for the example inputs at month 24', () => {
-    const result = calculateTotalCapitalNeeded(purchaseTarget, assumptions, 24);
+  it('returns ~$148,000 at month 0 (no appreciation, 20% down + 3% closing + $10k move-in)', () => {
+    const result = calculatePurchaseDayCapital(purchaseTarget, assumptions, 0);
+    // 600,000 × 0.23 + 10,000 = 148,000 exactly
+    expect(result).toBeCloseTo(148_000, 0);
+  });
 
-    // Correct formula value — within $500 for floating-point rounding
-    expect(result).toBeGreaterThanOrEqual(160_360);
-    expect(result).toBeLessThanOrEqual(161_360);
+  it('returns more at month 24 than month 0 due to appreciation', () => {
+    const at0  = calculatePurchaseDayCapital(purchaseTarget, assumptions, 0);
+    const at24 = calculatePurchaseDayCapital(purchaseTarget, assumptions, 24);
+    expect(at24).toBeGreaterThan(at0);
   });
 
   it('uses targetMonthsFromNow as default when atMonthsFromNow is omitted', () => {
-    const explicit = calculateTotalCapitalNeeded(purchaseTarget, assumptions, 24);
-    const defaulted = calculateTotalCapitalNeeded(purchaseTarget, assumptions);
+    const explicit = calculatePurchaseDayCapital(purchaseTarget, assumptions, 24);
+    const defaulted = calculatePurchaseDayCapital(purchaseTarget, assumptions);
     expect(explicit).toBeCloseTo(defaulted, 5);
   });
 
-  it('returns more capital needed at 36 months than at 24 months (appreciation grows the goal)', () => {
-    const at24 = calculateTotalCapitalNeeded(purchaseTarget, assumptions, 24);
-    const at36 = calculateTotalCapitalNeeded(purchaseTarget, assumptions, 36);
-    expect(at36).toBeGreaterThan(at24);
+  it('does NOT include post-close reserve percentage', () => {
+    // Reserve is 2% of appreciatedPrice. If included the result would be higher.
+    const withReserveIncluded = calculatePurchaseDayCapital(purchaseTarget, assumptions, 0);
+    // 600,000 × 0.23 + 10,000 = 148,000 (no reserve)
+    // 600,000 × 0.25 + 10,000 = 160,000 (with reserve) — should NOT match this
+    expect(withReserveIncluded).toBeCloseTo(148_000, 0);
+    expect(withReserveIncluded).not.toBeCloseTo(160_000, 0);
   });
 
-  it('returns exactly homePrice × percentages with zero appreciation and zero months', () => {
-    const flatAssumptions: InvestmentAssumptions = {
-      ...assumptions,
-      homePriceAppreciation: 0,
-    };
-    const result = calculateTotalCapitalNeeded(purchaseTarget, flatAssumptions, 0);
-    // 600,000 × 0.25 = 150,000
-    expect(result).toBeCloseTo(150_000, 2);
+  it('returns more capital with higher moveInCosts', () => {
+    const base    = calculatePurchaseDayCapital(purchaseTarget, assumptions, 0);
+    const higher  = calculatePurchaseDayCapital({ ...purchaseTarget, moveInCosts: 25_000 }, assumptions, 0);
+    expect(higher - base).toBeCloseTo(15_000, 0);
   });
 });
 
-// ─── 2. generateProjection — array length ────────────────────────────────────
+// ─── 2. calculateFullReadinessCapital ────────────────────────────────────────
+
+describe('calculateFullReadinessCapital', () => {
+  /**
+   * Uses a fixed mock mortgage result to keep the test isolated from the
+   * mortgage calculation logic.
+   *
+   * At month 0 with mock mortgage total $2,500/mo:
+   *   purchaseDayCapital        = 148,000
+   *   postCloseReserve          = 600,000 × 0.02 = 12,000
+   *   postPurchaseMonthlyExp    = 2,500 + 3,000 = 5,500
+   *   liquidityBuffer           = 5,500 × 4 = 22,000
+   *   fullReadinessCapital      = 148,000 + 12,000 + 22,000 = 182,000
+   */
+  const mockMortgageResult: MortgagePaymentResult = {
+    principalAndInterest: 2_000,
+    pmi: 0,
+    tax: 300,
+    insurance: 200,
+    total: 2_500,
+  };
+
+  it('adds post-close reserve and 4-month liquidity buffer on top of purchase day capital', () => {
+    const result = calculateFullReadinessCapital(
+      purchaseTarget,
+      cashFlow,
+      mockMortgageResult,
+      assumptions,
+      0
+    );
+    // 148,000 + 12,000 + 22,000 = 182,000
+    expect(result).toBeCloseTo(182_000, 0);
+  });
+
+  it('is always greater than calculatePurchaseDayCapital at the same horizon', () => {
+    const purchaseDay = calculatePurchaseDayCapital(purchaseTarget, assumptions, 0);
+    const fullReadiness = calculateFullReadinessCapital(
+      purchaseTarget,
+      cashFlow,
+      mockMortgageResult,
+      assumptions,
+      0
+    );
+    expect(fullReadiness).toBeGreaterThan(purchaseDay);
+  });
+
+  it('increases when otherMonthlyExpenses increases (larger buffer)', () => {
+    const base  = calculateFullReadinessCapital(purchaseTarget, cashFlow, mockMortgageResult, assumptions, 0);
+    const higher = calculateFullReadinessCapital(
+      purchaseTarget,
+      { ...cashFlow, otherMonthlyExpenses: 5_000 },
+      mockMortgageResult,
+      assumptions,
+      0
+    );
+    // buffer delta = (5000 - 3000) × 4 = 8,000
+    expect(higher - base).toBeCloseTo(8_000, 0);
+  });
+
+  it('uses targetMonthsFromNow as default when atMonthsFromNow is omitted', () => {
+    const explicit = calculateFullReadinessCapital(purchaseTarget, cashFlow, mockMortgageResult, assumptions, 24);
+    const defaulted = calculateFullReadinessCapital(purchaseTarget, cashFlow, mockMortgageResult, assumptions);
+    expect(explicit).toBeCloseTo(defaulted, 5);
+  });
+});
+
+// ─── 3. calculateMonthlyViability ────────────────────────────────────────────
+
+describe('calculateMonthlyViability', () => {
+  /**
+   * Formula: monthlyNet = grossIncome/12 - mortgage.total - otherExpenses + rent
+   */
+
+  it('case 1: $120k income, $3,200 mortgage, $3,000 expenses, $2,500 rent → isViable=true, net=$6,300', () => {
+    const cf: MonthlyCashFlow = {
+      grossIncome:               120_000,
+      monthlyHomeSavings:        0,
+      otherSavingsRate:          0,
+      annualIncomeGrowthRate:    0.03,
+      annualSavingsRateIncrease: 0,
+      currentMonthlyRent:        2_500,
+      otherMonthlyExpenses:      3_000,
+    };
+    const mortgage: MortgagePaymentResult = {
+      principalAndInterest: 2_600,
+      pmi: 0,
+      tax: 350,
+      insurance: 250,
+      total: 3_200,
+    };
+    // monthlyNet = 10,000 - 3,200 - 3,000 + 2,500 = 6,300
+    const result = calculateMonthlyViability(cf, mortgage);
+    expect(result.isViable).toBe(true);
+    expect(result.monthlyNet).toBeCloseTo(6_300, 2);
+    expect(result.deficit).toBe(0);
+  });
+
+  it('case 2: $60k income, $3,200 mortgage, $3,000 expenses, $2,500 rent → isViable=true, net=$1,300', () => {
+    const cf: MonthlyCashFlow = {
+      grossIncome:               60_000,
+      monthlyHomeSavings:        0,
+      otherSavingsRate:          0,
+      annualIncomeGrowthRate:    0.03,
+      annualSavingsRateIncrease: 0,
+      currentMonthlyRent:        2_500,
+      otherMonthlyExpenses:      3_000,
+    };
+    const mortgage: MortgagePaymentResult = {
+      principalAndInterest: 2_600,
+      pmi: 0,
+      tax: 350,
+      insurance: 250,
+      total: 3_200,
+    };
+    // monthlyNet = 5,000 - 3,200 - 3,000 + 2,500 = 1,300
+    const result = calculateMonthlyViability(cf, mortgage);
+    expect(result.isViable).toBe(true);
+    expect(result.monthlyNet).toBeCloseTo(1_300, 2);
+    expect(result.deficit).toBe(0);
+  });
+
+  it('case 3: $60k income, $4,500 mortgage, $3,500 expenses, $2,000 rent → isViable=false, deficit=$1,000', () => {
+    const cf: MonthlyCashFlow = {
+      grossIncome:               60_000,
+      monthlyHomeSavings:        0,
+      otherSavingsRate:          0,
+      annualIncomeGrowthRate:    0.03,
+      annualSavingsRateIncrease: 0,
+      currentMonthlyRent:        2_000,
+      otherMonthlyExpenses:      3_500,
+    };
+    const mortgage: MortgagePaymentResult = {
+      principalAndInterest: 3_800,
+      pmi: 0,
+      tax: 450,
+      insurance: 250,
+      total: 4_500,
+    };
+    // monthlyNet = 5,000 - 4,500 - 3,500 + 2,000 = -1,000
+    const result = calculateMonthlyViability(cf, mortgage);
+    expect(result.isViable).toBe(false);
+    expect(result.monthlyNet).toBeCloseTo(-1_000, 2);
+    expect(result.deficit).toBeCloseTo(1_000, 2);
+  });
+
+  it('treats monthlyNet === 0 as viable (not a deficit)', () => {
+    const cf: MonthlyCashFlow = {
+      grossIncome:               72_000,  // $6,000/mo
+      monthlyHomeSavings:        0,
+      otherSavingsRate:          0,
+      annualIncomeGrowthRate:    0.03,
+      annualSavingsRateIncrease: 0,
+      currentMonthlyRent:        2_000,
+      otherMonthlyExpenses:      3_000,
+    };
+    const mortgage: MortgagePaymentResult = {
+      principalAndInterest: 4_000,
+      pmi: 0,
+      tax: 700,
+      insurance: 300,
+      total: 5_000,
+    };
+    // monthlyNet = 6,000 - 5,000 - 3,000 + 2,000 = 0
+    const result = calculateMonthlyViability(cf, mortgage);
+    expect(result.isViable).toBe(true);
+    expect(result.monthlyNet).toBeCloseTo(0, 2);
+    expect(result.deficit).toBe(0);
+  });
+});
+
+// ─── 4. generateProjection — array length ────────────────────────────────────
 
 describe('generateProjection — data point count', () => {
   /**
@@ -179,7 +360,7 @@ describe('generateProjection — data point count', () => {
   });
 });
 
-// ─── 3. generateProjection — month 24 balance ────────────────────────────────
+// ─── 5. generateProjection — month 24 balance ────────────────────────────────
 
 describe('generateProjection — month 24 projected balance', () => {
   /**
@@ -218,7 +399,7 @@ describe('generateProjection — month 24 projected balance', () => {
   });
 });
 
-// ─── 4. getGlidePathEquityPct — auto tier boundaries ─────────────────────────
+// ─── 6. getGlidePathEquityPct — auto tier boundaries ─────────────────────────
 
 describe('getGlidePathEquityPct — auto mode tier thresholds', () => {
   const autoSettings: GlidePathSettings = { mode: 'auto', manualEquityPct: 0 };
@@ -274,7 +455,7 @@ describe('getGlidePathEquityPct — auto mode tier thresholds', () => {
   });
 });
 
-// ─── 5. calculateAccessibleCapital — capital gains tax ───────────────────────
+// ─── 7. calculateAccessibleCapital — capital gains tax ───────────────────────
 
 describe('calculateAccessibleCapital — capital gains tax on brokerage', () => {
   /**
@@ -386,7 +567,7 @@ describe('calculateAccessibleCapital — capital gains tax on brokerage', () => 
   });
 });
 
-// ─── 6. getExpectedAnnualReturn — two-asset blend ────────────────────────────
+// ─── 8. getExpectedAnnualReturn — two-asset blend ────────────────────────────
 
 describe('getExpectedAnnualReturn', () => {
   /**

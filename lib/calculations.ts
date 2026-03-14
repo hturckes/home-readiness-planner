@@ -11,6 +11,8 @@ import {
   AssetBucket,
   GlidePathSettings,
   InvestmentAssumptions,
+  MonthlyCashFlow,
+  MortgagePaymentResult,
   ProjectionPoint,
   PurchaseTarget,
   ReadinessDimension,
@@ -39,26 +41,15 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-// ─── Function 1: calculateTotalCapitalNeeded ─────────────────────────────────
-
 /**
- * Returns the total capital needed to purchase the home at a given point
- * in time, after home-price appreciation is applied.
+ * Returns the appreciated home price at the given number of months from now.
+ * Uses monthly compounding per CLAUDE.md architecture rules.
  *
- * Formula:
- *   adjustedPrice = targetHomePrice × (1 + homePriceAppreciation / 12) ^ months
- *   total = adjustedPrice × (downPaymentPct + closingCostPct + postCloseReservePct)
- *
- * Monthly compounding is used so that shorter and longer horizons are treated
- * consistently even when the function is called mid-projection.
- *
- * @param purchaseTarget  The user's purchase target configuration.
- * @param assumptions     Investment and market assumptions (provides homePriceAppreciation).
- * @param atMonthsFromNow Months from today to evaluate at. Defaults to
- *                        purchaseTarget.targetMonthsFromNow when omitted.
- * @returns Total dollar amount of capital needed.
+ * @param purchaseTarget  Purchase target configuration (source of targetHomePrice).
+ * @param assumptions     Assumptions (source of homePriceAppreciation).
+ * @param atMonthsFromNow Months from today. Defaults to targetMonthsFromNow.
  */
-export function calculateTotalCapitalNeeded(
+function getAppreciatedPrice(
   purchaseTarget: PurchaseTarget,
   assumptions: InvestmentAssumptions,
   atMonthsFromNow?: number
@@ -67,20 +58,117 @@ export function calculateTotalCapitalNeeded(
     atMonthsFromNow !== undefined
       ? atMonthsFromNow
       : purchaseTarget.targetMonthsFromNow;
-
-  const monthlyAppreciationRate = assumptions.homePriceAppreciation / 12;
-  const adjustedPrice =
-    purchaseTarget.targetHomePrice * Math.pow(1 + monthlyAppreciationRate, months);
-
-  const totalPct =
-    purchaseTarget.downPaymentPct +
-    purchaseTarget.closingCostPct +
-    purchaseTarget.postCloseReservePct;
-
-  return adjustedPrice * totalPct;
+  const monthlyRate = assumptions.homePriceAppreciation / 12;
+  return purchaseTarget.targetHomePrice * Math.pow(1 + monthlyRate, months);
 }
 
-// ─── Function 2: calculateAccessibleCapital ──────────────────────────────────
+// ─── Function 1: calculatePurchaseDayCapital ──────────────────────────────────
+
+/**
+ * One-time capital required at time of purchase. Includes down payment,
+ * closing costs, and move-in expenses.
+ *
+ * Formula:
+ *   appreciatedPrice   = targetHomePrice × (1 + homePriceAppreciation/12)^months
+ *   purchaseDayCapital = appreciatedPrice × (downPaymentPct + closingCostPct)
+ *                        + moveInCosts
+ *
+ * Note: post-close reserve is NOT included here — it stays in the account.
+ * moveInCosts is a flat dollar addition (not percentage-based).
+ *
+ * @param purchaseTarget  The user's purchase target configuration.
+ * @param assumptions     Investment and market assumptions.
+ * @param atMonthsFromNow Months from today to evaluate at. Defaults to
+ *                        purchaseTarget.targetMonthsFromNow when omitted.
+ * @returns Dollar amount of capital leaving the account on or before closing.
+ */
+export function calculatePurchaseDayCapital(
+  purchaseTarget: PurchaseTarget,
+  assumptions: InvestmentAssumptions,
+  atMonthsFromNow?: number
+): number {
+  const appreciatedPrice = getAppreciatedPrice(purchaseTarget, assumptions, atMonthsFromNow);
+  return (
+    appreciatedPrice * (purchaseTarget.downPaymentPct + purchaseTarget.closingCostPct) +
+    purchaseTarget.moveInCosts
+  );
+}
+
+// ─── Function 2: calculateFullReadinessCapital ────────────────────────────────
+
+/**
+ * Full capital needed to purchase with confidence. Includes purchase day
+ * capital, post-close reserve, and 4 months of post-purchase living expenses
+ * as a transition buffer.
+ *
+ * Formula:
+ *   postPurchaseMonthlyExpenses = mortgageResult.total + cashFlow.otherMonthlyExpenses
+ *   liquidityBuffer             = postPurchaseMonthlyExpenses × 4
+ *   postCloseReserve            = appreciatedPrice × postCloseReservePct
+ *   fullReadinessCapital        = calculatePurchaseDayCapital(...)
+ *                                 + postCloseReserve
+ *                                 + liquidityBuffer
+ *
+ * @param purchaseTarget  The user's purchase target configuration.
+ * @param cashFlow        Monthly cash flow inputs (provides otherMonthlyExpenses).
+ * @param mortgageResult  Pre-computed mortgage payment result (provides total PITI+PMI).
+ * @param assumptions     Investment and market assumptions.
+ * @param atMonthsFromNow Months from today to evaluate at. Defaults to
+ *                        purchaseTarget.targetMonthsFromNow when omitted.
+ * @returns Total dollar amount of capital required to be fully purchase-ready.
+ */
+export function calculateFullReadinessCapital(
+  purchaseTarget: PurchaseTarget,
+  cashFlow: MonthlyCashFlow,
+  mortgageResult: MortgagePaymentResult,
+  assumptions: InvestmentAssumptions,
+  atMonthsFromNow?: number
+): number {
+  const appreciatedPrice = getAppreciatedPrice(purchaseTarget, assumptions, atMonthsFromNow);
+  const purchaseDayCapital = calculatePurchaseDayCapital(purchaseTarget, assumptions, atMonthsFromNow);
+  const postCloseReserve = appreciatedPrice * purchaseTarget.postCloseReservePct;
+  const postPurchaseMonthlyExpenses = mortgageResult.total + cashFlow.otherMonthlyExpenses;
+  const liquidityBuffer = postPurchaseMonthlyExpenses * 4;
+  return purchaseDayCapital + postCloseReserve + liquidityBuffer;
+}
+
+// ─── Function 3: calculateMonthlyViability ────────────────────────────────────
+
+/**
+ * Checks whether post-purchase monthly cash flow is positive. If negative,
+ * the user cannot sustain the mortgage and the app should block the
+ * readiness projection.
+ *
+ * Formula:
+ *   monthlyNet = (cashFlow.grossIncome / 12)
+ *                − mortgageResult.total
+ *                − cashFlow.otherMonthlyExpenses
+ *                + cashFlow.currentMonthlyRent   ← rent disappears after purchase
+ *   isViable   = monthlyNet >= 0
+ *   deficit    = isViable ? 0 : Math.abs(monthlyNet)
+ *
+ * @param cashFlow       Monthly cash flow inputs.
+ * @param mortgageResult Pre-computed mortgage payment result.
+ * @returns Object with isViable flag, monthlyNet, and deficit.
+ */
+export function calculateMonthlyViability(
+  cashFlow: MonthlyCashFlow,
+  mortgageResult: MortgagePaymentResult
+): { isViable: boolean; monthlyNet: number; deficit: number } {
+  const monthlyNet =
+    cashFlow.grossIncome / 12 -
+    mortgageResult.total -
+    cashFlow.otherMonthlyExpenses +
+    cashFlow.currentMonthlyRent;
+  const isViable = monthlyNet >= 0;
+  return {
+    isViable,
+    monthlyNet,
+    deficit: isViable ? 0 : Math.abs(monthlyNet),
+  };
+}
+
+// ─── Function 4: calculateAccessibleCapital ──────────────────────────────────
 
 /**
  * Returns the total accessible capital from all eligible asset buckets,
@@ -114,7 +202,7 @@ export function calculateAccessibleCapital(
   }, 0);
 }
 
-// ─── Function 3: getGlidePathEquityPct ───────────────────────────────────────
+// ─── Function 5: getGlidePathEquityPct ───────────────────────────────────────
 
 /**
  * Returns the appropriate equity allocation percentage for a given
@@ -152,7 +240,7 @@ export function getGlidePathEquityPct(
   return 0.05;
 }
 
-// ─── Function 4: getExpectedAnnualReturn ─────────────────────────────────────
+// ─── Function 6: getExpectedAnnualReturn ─────────────────────────────────────
 
 /**
  * Calculates the blended expected annual return for a given equity allocation.
@@ -179,102 +267,7 @@ export function getExpectedAnnualReturn(
   );
 }
 
-// ─── Function 5: generateProjection ──────────────────────────────────────────
-
-/**
- * Generates a month-by-month projection of capital accumulation from today
- * (month 0) through targetMonthsFromNow + 6.
- *
- * Each step applies the CLAUDE.md accumulation formula:
- *   balance = (previousBalance + monthlyHomeSavings) × (1 + monthlyReturn)
- * where monthlyReturn = annualReturn / 12.
- *
- * Month 0 is the current state — the formula is applied starting at month 1.
- * The savingsTarget is constant across all points (capital needed at
- * targetMonthsFromNow after home-price appreciation) so it serves as a flat
- * goal-line in the projection chart.
- *
- * @param state Full application state (source of truth for all inputs).
- * @returns Array of ProjectionPoint objects ordered by month.
- */
-export function generateProjection(state: AppState): ProjectionPoint[] {
-  const { purchaseTarget, assetBuckets, cashFlow, assumptions, glidePathSettings } = state;
-  const { targetMonthsFromNow } = purchaseTarget;
-  const { monthlyHomeSavings } = cashFlow;
-
-  const totalMonths = targetMonthsFromNow + 6;
-
-  // Starting balance: accessible capital today
-  const initialBalance = calculateAccessibleCapital(
-    assetBuckets,
-    assumptions.capitalGainsTaxRate
-  );
-
-  // The goal line: capital required at the target date (fixed for the chart)
-  const savingsTarget = calculateTotalCapitalNeeded(
-    purchaseTarget,
-    assumptions,
-    targetMonthsFromNow
-  );
-
-  const points: ProjectionPoint[] = [];
-  let balance = initialBalance;
-
-  for (let month = 0; month <= totalMonths; month++) {
-    const monthsToTarget = targetMonthsFromNow - month;
-    const equityPct = getGlidePathEquityPct(monthsToTarget, glidePathSettings);
-    const expectedReturn = getExpectedAnnualReturn(equityPct, assumptions);
-    const monthlyReturn = expectedReturn / 12;
-
-    if (month > 0) {
-      // Apply the CLAUDE.md formula: add savings first, then apply return
-      balance = (balance + monthlyHomeSavings) * (1 + monthlyReturn);
-    }
-
-    points.push({
-      month,
-      projectedBalance: balance,
-      savingsTarget,
-      equityPct,
-      expectedReturn,
-    });
-  }
-
-  return points;
-}
-
-// ─── Function 6: findReadinessDate ───────────────────────────────────────────
-
-/**
- * Finds the first month in the projection where the projected balance meets
- * or exceeds the savings target.
- *
- * The savings target is read from each point's own savingsTarget field
- * (which is constant across all points — see generateProjection).
- *
- * @param projection    Array of ProjectionPoints from generateProjection().
- * @param purchaseTarget  Purchase target configuration (currently unused —
- *                        included for future use with dynamic targets).
- * @param assumptions   Investment assumptions (currently unused — included for
- *                      future use with dynamic targets).
- * @returns The month number when the target is first reached, or null if
- *          the target is never reached within the projection window.
- */
-export function findReadinessDate(
-  projection: ProjectionPoint[],
-  purchaseTarget: PurchaseTarget,       // eslint-disable-line @typescript-eslint/no-unused-vars
-  assumptions: InvestmentAssumptions    // eslint-disable-line @typescript-eslint/no-unused-vars
-): number | null {
-  for (const point of projection) {
-    if (point.projectedBalance >= point.savingsTarget) {
-      return point.month;
-    }
-  }
-  return null;
-}
-
-// ─── Function 8: calculateMortgagePayment ────────────────────────────────────
-// (Defined before calculateReadinessScore because it is called from there.)
+// ─── Function 7: calculateMortgagePayment ────────────────────────────────────
 
 /**
  * Estimates the total monthly mortgage payment (PITI + PMI) at the projected
@@ -291,24 +284,17 @@ export function findReadinessDate(
  *   Insurance — annualInsurance / 12
  *
  * @param state Full application state.
- * @returns Object with individual payment components and a total.
+ * @returns MortgagePaymentResult with individual payment components and a total.
  */
-export function calculateMortgagePayment(state: AppState): {
-  principalAndInterest: number;
-  pmi: number;
-  tax: number;
-  insurance: number;
-  total: number;
-} {
+export function calculateMortgagePayment(state: AppState): MortgagePaymentResult {
   const { purchaseTarget, assumptions, mortgageInputs } = state;
 
   // Home price after appreciation at the target date
-  const appreciatedHomePrice = calculateTotalCapitalNeeded(
-    { ...purchaseTarget, downPaymentPct: 1, closingCostPct: 0, postCloseReservePct: 0 },
+  const appreciatedHomePrice = getAppreciatedPrice(
+    purchaseTarget,
     assumptions,
     purchaseTarget.targetMonthsFromNow
   );
-  // ^ Trick: pass 100% "down payment" so the formula returns only the appreciated price.
 
   const loanAmount = Math.max(
     0,
@@ -341,7 +327,101 @@ export function calculateMortgagePayment(state: AppState): {
   return { principalAndInterest, pmi, tax, insurance, total };
 }
 
-// ─── Function 7: calculateReadinessScore ─────────────────────────────────────
+// ─── Function 8: generateProjection ──────────────────────────────────────────
+
+/**
+ * Generates a month-by-month projection of capital accumulation from today
+ * (month 0) through targetMonthsFromNow + 6.
+ *
+ * Each step applies the CLAUDE.md accumulation formula:
+ *   balance = (previousBalance + monthlyHomeSavings) × (1 + monthlyReturn)
+ * where monthlyReturn = annualReturn / 12.
+ *
+ * Month 0 is the current state — the formula is applied starting at month 1.
+ * The savingsTarget is the Full Readiness Capital at the target date (constant
+ * across all projection points), serving as the goal-line in the chart.
+ *
+ * @param state Full application state (source of truth for all inputs).
+ * @returns Array of ProjectionPoint objects ordered by month.
+ */
+export function generateProjection(state: AppState): ProjectionPoint[] {
+  const { purchaseTarget, assetBuckets, cashFlow, assumptions, glidePathSettings } = state;
+  const { targetMonthsFromNow } = purchaseTarget;
+  const { monthlyHomeSavings } = cashFlow;
+
+  const totalMonths = targetMonthsFromNow + 6;
+
+  // Starting balance: accessible capital today
+  const initialBalance = calculateAccessibleCapital(
+    assetBuckets,
+    assumptions.capitalGainsTaxRate
+  );
+
+  // The goal line: full readiness capital required at the target date
+  const mortgageResult = calculateMortgagePayment(state);
+  const savingsTarget = calculateFullReadinessCapital(
+    purchaseTarget,
+    cashFlow,
+    mortgageResult,
+    assumptions,
+    targetMonthsFromNow
+  );
+
+  const points: ProjectionPoint[] = [];
+  let balance = initialBalance;
+
+  for (let month = 0; month <= totalMonths; month++) {
+    const monthsToTarget = targetMonthsFromNow - month;
+    const equityPct = getGlidePathEquityPct(monthsToTarget, glidePathSettings);
+    const expectedReturn = getExpectedAnnualReturn(equityPct, assumptions);
+    const monthlyReturn = expectedReturn / 12;
+
+    if (month > 0) {
+      // Apply the CLAUDE.md formula: add savings first, then apply return
+      balance = (balance + monthlyHomeSavings) * (1 + monthlyReturn);
+    }
+
+    points.push({
+      month,
+      projectedBalance: balance,
+      savingsTarget,
+      equityPct,
+      expectedReturn,
+    });
+  }
+
+  return points;
+}
+
+// ─── Function 9: findReadinessDate ───────────────────────────────────────────
+
+/**
+ * Finds the first month in the projection where the projected balance meets
+ * or exceeds the savings target.
+ *
+ * The savings target is read from each point's own savingsTarget field
+ * (which is constant across all points — see generateProjection).
+ *
+ * @param projection    Array of ProjectionPoints from generateProjection().
+ * @param purchaseTarget  Purchase target configuration (reserved for future use).
+ * @param assumptions   Investment assumptions (reserved for future use).
+ * @returns The month number when the target is first reached, or null if
+ *          the target is never reached within the projection window.
+ */
+export function findReadinessDate(
+  projection: ProjectionPoint[],
+  purchaseTarget: PurchaseTarget,       // eslint-disable-line @typescript-eslint/no-unused-vars
+  assumptions: InvestmentAssumptions    // eslint-disable-line @typescript-eslint/no-unused-vars
+): number | null {
+  for (const point of projection) {
+    if (point.projectedBalance >= point.savingsTarget) {
+      return point.month;
+    }
+  }
+  return null;
+}
+
+// ─── Function 10: calculateReadinessScore ────────────────────────────────────
 
 /**
  * Scores the user's current financial position across all five readiness
@@ -374,7 +454,7 @@ export function calculateReadinessScore(
       status: 'red',
       label: 'Off Track',
       message:
-        'Your projected savings will not reach the capital target within the extended window. Consider increasing monthly savings, adjusting your timeline, or revising the target price.',
+        'Your projected savings will not reach full readiness capital within the extended window. Consider increasing monthly savings, adjusting your timeline, or revising the target price.',
     };
   } else {
     const monthsAheadOrBehind = readinessMonth - targetMonthsFromNow;
@@ -382,26 +462,27 @@ export function calculateReadinessScore(
       capitalTrajectory = {
         status: 'green',
         label: 'On Track',
-        message: `You're projected to reach your savings target on time${monthsAheadOrBehind < 0 ? ` — ${Math.abs(monthsAheadOrBehind)} month${Math.abs(monthsAheadOrBehind) === 1 ? '' : 's'} early` : ''}.`,
+        message: `You're projected to reach full readiness capital on time${monthsAheadOrBehind < 0 ? ` — ${Math.abs(monthsAheadOrBehind)} month${Math.abs(monthsAheadOrBehind) === 1 ? '' : 's'} early` : ''}.`,
       };
     } else if (monthsAheadOrBehind <= 6) {
       capitalTrajectory = {
         status: 'amber',
         label: 'Slightly Behind',
-        message: `You're projected to hit your target ${monthsAheadOrBehind} month${monthsAheadOrBehind === 1 ? '' : 's'} after your intended date. A modest savings increase would close the gap.`,
+        message: `You're projected to hit full readiness capital ${monthsAheadOrBehind} month${monthsAheadOrBehind === 1 ? '' : 's'} after your intended date. A modest savings increase would close the gap.`,
       };
     } else {
       capitalTrajectory = {
         status: 'red',
         label: 'Behind Target',
-        message: `You're projected to reach your target ${monthsAheadOrBehind} months past your intended date. Consider increasing monthly savings or extending your timeline.`,
+        message: `You're projected to reach full readiness capital ${monthsAheadOrBehind} months past your intended date. Consider increasing monthly savings or extending your timeline.`,
       };
     }
   }
 
   // ── Savings Rate ───────────────────────────────────────────────────────────
   // Compare actual monthly home savings to the amount required to hit the
-  // target on time from the current accessible capital position.
+  // full readiness capital target on time.
+  // (savingsTarget comes from generateProjection which already uses calculateFullReadinessCapital)
 
   let savingsRate: ReadinessDimension;
 
@@ -419,7 +500,7 @@ export function calculateReadinessScore(
     savingsRate = {
       status: 'green',
       label: 'Fully Funded',
-      message: 'Your current accessible capital already covers the total capital needed.',
+      message: 'Your current accessible capital already covers full readiness capital.',
     };
   } else {
     const actualSavings = cashFlow.monthlyHomeSavings;
@@ -527,42 +608,42 @@ export function calculateReadinessScore(
   }
 
   // ── Reserve Cushion ────────────────────────────────────────────────────────
-  // Post-close reserve as a multiple of gross monthly income.
+  // Post-close reserve measured against post-purchase monthly expenses
+  // (mortgage + other monthly expenses), not gross income.
 
   let reserveCushion: ReadinessDimension;
 
-  // Appreciated home price at target date (same calculation used for mortgage)
-  const appreciatedHomePrice = purchaseTarget.targetHomePrice *
-    Math.pow(1 + assumptions.homePriceAppreciation / 12, targetMonthsFromNow);
+  const appreciatedHomePrice = getAppreciatedPrice(purchaseTarget, assumptions, targetMonthsFromNow);
   const reserveAmount = purchaseTarget.postCloseReservePct * appreciatedHomePrice;
+  const postPurchaseMonthlyExpenses = monthlyPITI + cashFlow.otherMonthlyExpenses;
 
-  if (monthlyGrossIncome <= 0) {
+  if (postPurchaseMonthlyExpenses <= 0) {
     reserveCushion = {
       status: 'amber',
-      label: 'Income Unknown',
+      label: 'Expenses Unknown',
       message:
-        'Enter your gross monthly income to evaluate your post-close reserve cushion.',
+        'Enter your mortgage details and monthly expenses to evaluate your post-close reserve cushion.',
     };
   } else {
-    const reserveMonths = reserveAmount / monthlyGrossIncome;
+    const monthsCovered = reserveAmount / postPurchaseMonthlyExpenses;
 
-    if (reserveMonths > 3) {
+    if (monthsCovered > 3) {
       reserveCushion = {
         status: 'green',
         label: 'Adequate Reserve',
-        message: `Your planned post-close reserve of ${formatUSD(reserveAmount)} covers ${reserveMonths.toFixed(1)} months of gross income — well above the 3-month guideline.`,
+        message: `Your planned post-close reserve of ${formatUSD(reserveAmount)} covers ${monthsCovered.toFixed(1)} months of post-purchase expenses — well above the 3-month guideline.`,
       };
-    } else if (reserveMonths >= 1) {
+    } else if (monthsCovered >= 1) {
       reserveCushion = {
         status: 'amber',
         label: 'Thin Reserve',
-        message: `Your planned reserve of ${formatUSD(reserveAmount)} covers ${reserveMonths.toFixed(1)} months of gross income. Aim for at least 3 months to buffer unexpected post-purchase expenses.`,
+        message: `Your planned reserve of ${formatUSD(reserveAmount)} covers ${monthsCovered.toFixed(1)} months of post-purchase expenses. Aim for at least 3 months to buffer unexpected costs after closing.`,
       };
     } else {
       reserveCushion = {
         status: 'red',
         label: 'Insufficient Reserve',
-        message: `Your planned reserve of ${formatUSD(reserveAmount)} covers less than 1 month of gross income. Increase the post-close reserve percentage or revisit the target price.`,
+        message: `Your planned reserve of ${formatUSD(reserveAmount)} covers less than 1 month of post-purchase expenses. Increase the post-close reserve percentage or revisit the target price.`,
       };
     }
   }
